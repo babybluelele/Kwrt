@@ -1,18 +1,13 @@
 #=================================================
-# Fork 自 kiddin9/Kwrt
-# 修改：去掉了 kiddin9 专用的 token 和包更新步骤
+# Fork 自 P3TERX/Actions-OpenWrt
+# 修改：去掉 kiddin9 专用 token 和包更新步骤
 # 使用 GITHUB_TOKEN 来触发本仓库的 build
 #=================================================
 
-name: Repo Dispatcher
+name: OpenWrt AutoBuild
 
-on:
-  workflow_dispatch:
-    inputs:
-      param:
-        description: 'parameter'
-        required: false
-        default: ''
+on: 
+  repository_dispatch:
 
 env:
   TZ: Asia/Shanghai
@@ -20,16 +15,18 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
+    
+    name: Build ${{matrix.target}}
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ["${{ github.event.client_payload.target }}"]
+        
     steps:
     - name: Checkout
       uses: actions/checkout@v4
-
-    - name: Cancel running workflows
-      uses: styfle/cancel-workflow-action@main
-      if: contains(github.event.inputs.param, 'cw')
       with:
-        workflow_id: all
-        access_token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
 
     - name: Load Settings.ini
       run: |
@@ -39,22 +36,93 @@ jobs:
         fi
         echo "REPO_URL=${REPO_URL}" >> $GITHUB_ENV
         echo "REPO_BRANCH=${REPO_BRANCH}" >> $GITHUB_ENV
+        echo "CONFIG_FILE=${CONFIG_FILE}" >> $GITHUB_ENV
+        echo "DIY_SH=${DIY_SH}" >> $GITHUB_ENV
+        echo "UPLOAD_FIRMWARE_FOR_ARTIFACT=${UPLOAD_FIRMWARE_FOR_ARTIFACT}" >> $GITHUB_ENV
+        echo "UPLOAD_FIRMWARE_FOR_RELEASE=${UPLOAD_FIRMWARE_FOR_RELEASE}" >> $GITHUB_ENV
 
-    - name: Trigger Compile
+    - name: Free disk space
+      uses: coder-xiaomo/free-disk-space@main
+      with:
+        tool-cache: false
+        android: true
+        dotnet: true
+        haskell: true
+        large-packages: true
+        docker-images: true
+        swap-storage: true
+
+    - name: Setup Build Environment
+      env:
+        DEBIAN_FRONTEND: noninteractive
       run: |
-        sudo timedatectl set-timezone "$TZ"
+        sudo -E apt-get -qq update
+        sudo -E apt-get -qq install build-essential clang flex bison g++ gawk \
+        gcc-multilib g++-multilib gettext git libncurses5-dev libssl-dev \
+        python3-setuptools rsync swig unzip zlib1g-dev file wget \
+        llvm python3-pyelftools libpython3-dev aria2 jq qemu-utils ccache rename \
+        libelf-dev device-tree-compiler libgmp3-dev libmpc-dev libfuse-dev
+        sudo -E apt-get -qq autoremove --purge
+        sudo -E apt-get -qq clean
+        sudo timedatectl set-timezone "Asia/Shanghai"
+        git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        git config --global user.name "github-actions[bot]"
 
-        # 这里列出常见的 target，你可以根据需要删掉一些不编译的
-        for target in \
-          x86_64 x86_generic rockchip_armv8 \
-          mediatek_mt7622 mediatek_filogic \
-          ramips_mt7621 ramips_mt7620 ramips_mt76x8 \
-          armsr_armv8 \
-          ; do
+    - name: Clone source code
+      run: |
+        if [[ ! "${{ env.REPO_BRANCH }}" && "$REPO_URL" == "https://github.com/openwrt/openwrt" ]]; then
+            git clone $REPO_URL -b $REPO_BRANCH openwrt
+        else
+            git clone $REPO_URL openwrt
+            cd openwrt
+            git checkout ${REPO_BRANCH}
+        fi
 
-          echo "Trigger build for $target"
-          curl -X POST https://api.github.com/repos/${{ github.repository }}/dispatches \
-            -H "Accept: application/vnd.github.everest-preview+json" \
-            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            -d "{\"event_type\": \"${target} ${{ github.event.inputs.param }}\", \"client_payload\": {\"target\": \"${target}\"}}"
-        done
+    - name: Load custom config & DIY
+      run: |
+        cp -rf devices/common/. openwrt/
+        cp -rf devices/${{matrix.target}}/. openwrt/
+        cd openwrt
+        chmod +x devices/common/$DIY_SH
+        /bin/bash "devices/common/$DIY_SH"
+        cp -f devices/common/$CONFIG_FILE .config
+        if [ -f "devices/${{matrix.target}}/$CONFIG_FILE" ]; then
+          cat devices/${{matrix.target}}/$CONFIG_FILE >> .config
+        fi
+        if [ -f "devices/${{matrix.target}}/$DIY_SH" ]; then
+          chmod +x devices/${{matrix.target}}/$DIY_SH
+          /bin/bash "devices/${{matrix.target}}/$DIY_SH"
+        fi
+
+    - name: Apply patches
+      run: |
+        cd openwrt
+        find "devices/${{matrix.target}}/patches" -type f -name '*.patch' -print0 | xargs -0 -I % sh -c "cat '%' | patch -d './' -p1 --forward"
+
+    - name: Defconfig
+      run: |
+        cd openwrt
+        make defconfig
+
+    - name: Compile Firmware
+      run: |
+        cd openwrt
+        echo -e "$(($(nproc)+1)) threads compile"
+        make -j$(($(nproc)+1)) || (tail -50 build.log; exit 1)
+
+    - name: Upload firmware artifact
+      uses: actions/upload-artifact@v3
+      if: env.UPLOAD_FIRMWARE_FOR_ARTIFACT == 'true'
+      with:
+        name: ${{matrix.target}}-firmware
+        path: openwrt/bin/targets/
+
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v1
+      if: env.UPLOAD_FIRMWARE_FOR_RELEASE == 'true'
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        files: openwrt/bin/targets/*
+        name: ${{matrix.target}} firmware
+        tag_name: ${{ github.event.client_payload.target }}-release
